@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <array>
 
 class OrbitalProcessor : public juce::AudioProcessor
 {
@@ -31,6 +32,21 @@ public:
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
 
+    juce::AudioProcessorValueTreeState apvts;
+
+    // Lock-free FIFO for passing audio to the visualizer on the message thread
+    static constexpr int fifoCapacity = 96000;
+    juce::AbstractFifo       abstractFifo { fifoCapacity };
+    std::array<float, fifoCapacity> fifoData {};
+
 private:
+    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    std::vector<float> delayBufferL;
+    std::vector<float> delayBufferR;
+    int   delayBufferLength  = 0;
+    int   delayWritePosition = 0;
+    double currentSampleRate = 44100.0;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OrbitalProcessor)
 };
