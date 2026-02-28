@@ -3,6 +3,28 @@
 #include "PluginProcessor.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 
+//==============================================================================
+class SynthwaveLookAndFeel : public juce::LookAndFeel_V4
+{
+public:
+    SynthwaveLookAndFeel();
+
+    void drawRotarySlider(juce::Graphics&, int x, int y, int width, int height,
+                          float sliderPos, float rotaryStartAngle, float rotaryEndAngle,
+                          juce::Slider&) override;
+
+    void drawComboBox(juce::Graphics&, int width, int height, bool isButtonDown,
+                      int buttonX, int buttonY, int buttonW, int buttonH,
+                      juce::ComboBox&) override;
+
+    void drawPopupMenuItem(juce::Graphics&, const juce::Rectangle<int>& area,
+                           bool isSeparator, bool isActive, bool isHighlighted,
+                           bool isTicked, bool hasSubMenu,
+                           const juce::String& text, const juce::String& shortcutKeyText,
+                           const juce::Drawable* icon, const juce::Colour* textColour) override;
+};
+
+//==============================================================================
 class OrbitalEditor : public juce::AudioProcessorEditor,
                       private juce::Timer
 {
@@ -17,6 +39,7 @@ private:
     void timerCallback() override;
 
     OrbitalProcessor& processorRef;
+    SynthwaveLookAndFeel synthwaveLnF;
 
     // Title
     juce::Label titleLabel;
