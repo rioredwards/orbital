@@ -10,6 +10,8 @@ juce_add_plugin(Orbital
     FORMATS VST3 Standalone AU
     PRODUCT_NAME "Orbital"
     COPY_PLUGIN_AFTER_BUILD TRUE
+    IS_SYNTH TRUE
+    NEEDS_MIDI_INPUT TRUE
 )
 
 target_sources(Orbital PRIVATE
@@ -25,6 +27,7 @@ target_link_libraries(Orbital
         juce::juce_audio_devices
         juce::juce_audio_utils
         juce::juce_gui_basics
+        juce::juce_dsp
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags
