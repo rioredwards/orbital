@@ -1,0 +1,449 @@
+================================================================================
+ORBITAL DELAY PLUGIN — DETAILED IMPLEMENTATION PLAN
+================================================================================
+
+OVERVIEW
+--------
+Build a stereo delay effect plugin with three parameters (Time, Feedback,
+Effect Level/Mix), a custom dark-themed UI with rotary knobs, a title header,
+and a live audio waveform visualizer.
+
+Files to modify:
+  src/PluginProcessor.h
+  src/PluginProcessor.cpp
+  src/PluginEditor.h
+  src/PluginEditor.cpp
+
+CMakeLists.txt: NO CHANGES NEEDED — all required modules are already linked:
+  juce::juce_audio_processors  → AudioProcessorValueTreeState
+  juce::juce_audio_utils       → AudioVisualiserComponent
+  juce::juce_gui_basics        → Slider, Label, Graphics
+
+
+================================================================================
+STEP 1 — PluginProcessor.h: Add Members
+================================================================================
+
+Replace the existing header with the following declarations.
+
+Parameters (string IDs used throughout):
+  "time"      — Delay time in ms.  Range: 1.0 → 2000.0, default 500.0
+  "feedback"  — Feedback amount.   Range: 0.0 → 0.95,   default 0.35
+  "mix"       — Wet/dry blend.     Range: 0.0 → 1.0,    default 0.5
+
+New public member:
+  juce::AudioProcessorValueTreeState apvts;
+
+New private members:
+  // Parameter layout factory (called once in constructor initializer list)
+  static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+  // Stereo delay ring buffers
+  std::vector<float> delayBufferL;
+  std::vector<float> delayBufferR;
+  int   delayBufferLength  = 0;
+  int   delayWritePosition = 0;
+  double currentSampleRate = 44100.0;
+
+  // Lock-free FIFO for passing audio to the visualizer on the message thread
+  // 96000 samples = ~2 seconds at 48kHz; enough headroom at any sample rate
+  static constexpr int fifoCapacity = 96000;
+  juce::AbstractFifo       abstractFifo { fifoCapacity };
+  std::array<float, fifoCapacity> fifoData {};
+
+NOTE: abstractFifo and fifoData must be declared public (or the editor made a
+friend) so OrbitalEditor::timerCallback can read from them directly.
+Declare them public in the header.
+
+
+================================================================================
+STEP 2 — PluginProcessor.cpp: Parameter Layout
+================================================================================
+
+Add this static method above the constructor:
+
+  juce::AudioProcessorValueTreeState::ParameterLayout
+  OrbitalProcessor::createParameterLayout()
+  {
+      juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+      // Skew factor 0.5 gives logarithmic feel (fine control at low values)
+      layout.add(std::make_unique<juce::AudioParameterFloat>(
+          "time", "Delay Time",
+          juce::NormalisableRange<float>(1.0f, 2000.0f, 0.1f, 0.5f),
+          500.0f));
+
+      layout.add(std::make_unique<juce::AudioParameterFloat>(
+          "feedback", "Feedback",
+          juce::NormalisableRange<float>(0.0f, 0.95f, 0.01f),
+          0.35f));
+
+      layout.add(std::make_unique<juce::AudioParameterFloat>(
+          "mix", "Effect Level",
+          juce::NormalisableRange<float>(0.0f, 1.0f, 0.01f),
+          0.5f));
+
+      return layout;
+  }
+
+
+================================================================================
+STEP 3 — PluginProcessor.cpp: Constructor
+================================================================================
+
+Update the constructor to initialize the APVTS in the initializer list.
+The APVTS must be initialized AFTER AudioProcessor (its base) and receives
+*this, an UndoManager (nullptr = none), a state name, and the parameter layout.
+
+  OrbitalProcessor::OrbitalProcessor()
+      : AudioProcessor(BusesProperties()
+            .withInput ("Input",  juce::AudioChannelSet::stereo(), true)
+            .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+        apvts(*this, nullptr, "Parameters", createParameterLayout())
+  {
+  }
+
+
+================================================================================
+STEP 4 — PluginProcessor.cpp: prepareToPlay
+================================================================================
+
+Called by the host before playback. Allocate delay buffers sized to 2 seconds
+at the current sample rate, then zero them out and reset the write head.
+
+  void OrbitalProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/)
+  {
+      currentSampleRate = sampleRate;
+
+      // +1 sample of headroom to avoid off-by-one at maximum delay time
+      const int maxDelaySamples = static_cast<int>(2.0 * sampleRate) + 1;
+
+      delayBufferL.assign(maxDelaySamples, 0.0f);
+      delayBufferR.assign(maxDelaySamples, 0.0f);
+      delayBufferLength  = maxDelaySamples;
+      delayWritePosition = 0;
+
+      abstractFifo.reset();
+      fifoData.fill(0.0f);
+  }
+
+
+================================================================================
+STEP 5 — PluginProcessor.cpp: processBlock (Delay Algorithm)
+================================================================================
+
+The delay is a standard circular-buffer feedback delay:
+
+  For each sample i:
+    readPos  = (writePos - delaySamples + bufferLength) % bufferLength
+               ↑ adding bufferLength prevents negative modulo in C++
+    delayed  = delayBuffer[readPos]
+    delayBuffer[writePos] = dry + delayed * feedback    ← write input+echo
+    output[i] = dry * (1 - mix) + delayed * mix        ← blend dry/wet
+    writePos = (writePos + 1) % bufferLength
+
+  void OrbitalProcessor::processBlock(juce::AudioBuffer<float>& buffer,
+                                      juce::MidiBuffer&)
+  {
+      juce::ScopedNoDenormals noDenormals;
+
+      for (int i = getTotalNumInputChannels(); i < getTotalNumOutputChannels(); ++i)
+          buffer.clear(i, 0, buffer.getNumSamples());
+
+      // getRawParameterValue returns std::atomic<float>*, load() is thread-safe
+      const float delayTimeMs = apvts.getRawParameterValue("time")->load();
+      const float feedback    = apvts.getRawParameterValue("feedback")->load();
+      const float mix         = apvts.getRawParameterValue("mix")->load();
+
+      const int delaySamples = static_cast<int>(delayTimeMs * currentSampleRate / 1000.0);
+      const int numSamples   = buffer.getNumSamples();
+
+      // Handle mono-input plugins gracefully by mirroring channel 0
+      auto* dataL = buffer.getWritePointer(0);
+      auto* dataR = buffer.getWritePointer(buffer.getNumChannels() > 1 ? 1 : 0);
+
+      for (int i = 0; i < numSamples; ++i)
+      {
+          const int readPos = (delayWritePosition - delaySamples + delayBufferLength)
+                              % delayBufferLength;
+
+          const float dryL = dataL[i];
+          const float dryR = dataR[i];
+          const float delayedL = delayBufferL[readPos];
+          const float delayedR = delayBufferR[readPos];
+
+          delayBufferL[delayWritePosition] = dryL + delayedL * feedback;
+          delayBufferR[delayWritePosition] = dryR + delayedR * feedback;
+
+          dataL[i] = dryL * (1.0f - mix) + delayedL * mix;
+          dataR[i] = dryR * (1.0f - mix) + delayedR * mix;
+
+          delayWritePosition = (delayWritePosition + 1) % delayBufferLength;
+      }
+
+      // Push left-channel output to the lock-free FIFO for the visualizer.
+      // AbstractFifo splits the write into at most two contiguous chunks
+      // (wrapping around the end of the ring buffer).
+      int start1, size1, start2, size2;
+      abstractFifo.prepareToWrite(numSamples, start1, size1, start2, size2);
+      if (size1 > 0) std::copy_n(dataL,         size1, fifoData.data() + start1);
+      if (size2 > 0) std::copy_n(dataL + size1, size2, fifoData.data() + start2);
+      abstractFifo.finishedWrite(size1 + size2);
+  }
+
+
+================================================================================
+STEP 6 — PluginProcessor.cpp: State Save / Restore & Tail Length
+================================================================================
+
+APVTS serializes to XML automatically. getStateInformation/setStateInformation
+just wrap that:
+
+  void OrbitalProcessor::getStateInformation(juce::MemoryBlock& destData)
+  {
+      auto state = apvts.copyState();
+      std::unique_ptr<juce::XmlElement> xml(state.createXml());
+      copyXmlToBinary(*xml, destData);
+  }
+
+  void OrbitalProcessor::setStateInformation(const void* data, int sizeInBytes)
+  {
+      std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
+      if (xml != nullptr && xml->hasTagName(apvts.state.getType()))
+          apvts.replaceState(juce::ValueTree::fromXml(*xml));
+  }
+
+Update tail length (the plugin produces sound after input stops due to feedback):
+  double OrbitalProcessor::getTailLengthSeconds() const { return 2.0; }
+
+
+================================================================================
+STEP 7 — PluginEditor.h: Full Declaration
+================================================================================
+
+The editor subclasses juce::Timer so it can drain the processor FIFO and
+feed audio data into the AudioVisualiserComponent on the message thread.
+(AudioVisualiserComponent uses a CriticalSection internally — never push to it
+from the audio thread directly.)
+
+  #pragma once
+  #include "PluginProcessor.h"
+  #include <juce_audio_utils/juce_audio_utils.h>
+
+  class OrbitalEditor : public juce::AudioProcessorEditor,
+                        private juce::Timer
+  {
+  public:
+      explicit OrbitalEditor(OrbitalProcessor&);
+      ~OrbitalEditor() override;
+
+      void paint(juce::Graphics&) override;
+      void resized() override;
+
+  private:
+      void timerCallback() override;
+
+      OrbitalProcessor& processorRef;
+
+      juce::Label titleLabel;
+
+      juce::Slider timeKnob     { juce::Slider::RotaryVerticalDrag,
+                                  juce::Slider::TextBoxBelow };
+      juce::Slider feedbackKnob { juce::Slider::RotaryVerticalDrag,
+                                  juce::Slider::TextBoxBelow };
+      juce::Slider mixKnob      { juce::Slider::RotaryVerticalDrag,
+                                  juce::Slider::TextBoxBelow };
+
+      juce::Label timeLabel, feedbackLabel, mixLabel;
+
+      // Attachments bind sliders to APVTS parameters bidirectionally.
+      // Must be declared AFTER the sliders (initialization order matters).
+      juce::AudioProcessorValueTreeState::SliderAttachment timeAttachment;
+      juce::AudioProcessorValueTreeState::SliderAttachment feedbackAttachment;
+      juce::AudioProcessorValueTreeState::SliderAttachment mixAttachment;
+
+      // 1 channel (mono left-channel feed from processor)
+      juce::AudioVisualiserComponent visualiser { 1 };
+
+      JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OrbitalEditor)
+  };
+
+
+================================================================================
+STEP 8 — PluginEditor.cpp: Constructor
+================================================================================
+
+Window: 500 x 380 px
+
+Color palette:
+  Background:         0xff1a1a2e  (deep navy)
+  Accent / waveform:  0xff7b68ee  (medium slate blue)
+  Title text:         white
+  Label text:         0xffaaaaaa  (light gray)
+  Visualizer bg:      0xff0d0d1a  (near black)
+
+SliderAttachments must be initialized in the member initializer list so that
+APVTS parameter values are applied to the sliders before the window opens.
+
+  OrbitalEditor::OrbitalEditor(OrbitalProcessor& p)
+      : AudioProcessorEditor(&p),
+        processorRef(p),
+        timeAttachment     (p.apvts, "time",     timeKnob),
+        feedbackAttachment (p.apvts, "feedback", feedbackKnob),
+        mixAttachment      (p.apvts, "mix",      mixKnob)
+  {
+      setSize(500, 380);
+
+      // Title
+      titleLabel.setText("ORBITAL", juce::dontSendNotification);
+      titleLabel.setFont(juce::FontOptions(36.0f));
+      titleLabel.setJustificationType(juce::Justification::centred);
+      titleLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+      addAndMakeVisible(titleLabel);
+
+      // Helper: configure one knob + its label
+      auto setupKnob = [&](juce::Slider& knob, juce::Label& label,
+                           const juce::String& text)
+      {
+          knob.setColour(juce::Slider::rotarySliderFillColourId,
+                         juce::Colour(0xff7b68ee));
+          knob.setColour(juce::Slider::thumbColourId,
+                         juce::Colour(0xff7b68ee));
+          addAndMakeVisible(knob);
+
+          label.setText(text, juce::dontSendNotification);
+          label.setFont(juce::FontOptions(13.0f));
+          label.setJustificationType(juce::Justification::centred);
+          label.setColour(juce::Label::textColourId, juce::Colour(0xffaaaaaa));
+          addAndMakeVisible(label);
+      };
+
+      setupKnob(timeKnob,     timeLabel,     "TIME");
+      setupKnob(feedbackKnob, feedbackLabel, "FEEDBACK");
+      setupKnob(mixKnob,      mixLabel,      "MIX");
+
+      // Visualizer
+      visualiser.setBufferSize(512);
+      visualiser.setSamplesPerBlock(256);
+      visualiser.setColours(juce::Colour(0xff0d0d1a), juce::Colour(0xff7b68ee));
+      addAndMakeVisible(visualiser);
+
+      // 30 fps is smooth enough; timerCallback drains the audio FIFO
+      startTimerHz(30);
+  }
+
+  OrbitalEditor::~OrbitalEditor() {}
+
+
+================================================================================
+STEP 9 — PluginEditor.cpp: paint() and resized()
+================================================================================
+
+Layout (heights add up to 380):
+  Title area:      y=0,   h=68
+  Separator line:  y=65
+  Knobs area:      y=68,  h=222  (label 20px + knob 130px + textbox 30px = 180;
+                                   21px top padding + 21px bottom padding = 222)
+  Visualizer:      y=295, h=70, x=20, w=460
+
+  void OrbitalEditor::paint(juce::Graphics& g)
+  {
+      g.fillAll(juce::Colour(0xff1a1a2e));
+
+      // Accent separator line under title
+      g.setColour(juce::Colour(0xff7b68ee).withAlpha(0.35f));
+      g.drawHorizontalLine(65, 24.0f, static_cast<float>(getWidth() - 24));
+  }
+
+  void OrbitalEditor::resized()
+  {
+      const int w = getWidth();
+
+      titleLabel.setBounds(0, 0, w, 68);
+
+      // Divide horizontally into 3 equal columns for the knobs
+      const int colW    = w / 3;
+      const int labelH  = 20;
+      const int knobH   = 160;   // includes TextBoxBelow (JUCE draws it inside)
+      const int topPad  = 20;    // padding below the separator
+      const int labelY  = 68 + topPad;
+      const int knobY   = labelY + labelH + 4;
+
+      auto placeKnob = [&](juce::Slider& knob, juce::Label& label, int col)
+      {
+          const int cx = col * colW + colW / 2;
+          label.setBounds(cx - 60, labelY, 120, labelH);
+          knob .setBounds(cx - 75, knobY, 150, knobH);
+      };
+
+      placeKnob(timeKnob,     timeLabel,     0);
+      placeKnob(feedbackKnob, feedbackLabel, 1);
+      placeKnob(mixKnob,      mixLabel,      2);
+
+      visualiser.setBounds(20, 295, w - 40, 70);
+  }
+
+
+================================================================================
+STEP 10 — PluginEditor.cpp: timerCallback (Visualizer Feed)
+================================================================================
+
+Drain the processor's lock-free FIFO and push samples into the visualizer.
+AbstractFifo::prepareToRead splits available data into up to two contiguous
+chunks (chunk1 then optional chunk2 for wrap-around).
+pushBuffer signature: (const float* const* channelData, int numChannels, int numSamples)
+
+  void OrbitalEditor::timerCallback()
+  {
+      const int available = processorRef.abstractFifo.getNumReady();
+      if (available <= 0)
+          return;
+
+      int start1, size1, start2, size2;
+      processorRef.abstractFifo.prepareToRead(available, start1, size1, start2, size2);
+
+      const float* ptr1 = processorRef.fifoData.data() + start1;
+      const float* ptr2 = processorRef.fifoData.data() + start2;
+
+      if (size1 > 0) visualiser.pushBuffer(&ptr1, 1, size1);
+      if (size2 > 0) visualiser.pushBuffer(&ptr2, 1, size2);
+
+      processorRef.abstractFifo.finishedRead(size1 + size2);
+  }
+
+
+================================================================================
+STEP 11 — Build & Test
+================================================================================
+
+  cmake --build build --config Release --target Orbital_Standalone -j$(sysctl -n hw.logicalcpu)
+  open build/Orbital_artefacts/Release/Standalone/Orbital.app
+
+Verification checklist:
+  [ ] Window opens at 500x380 with dark navy background
+  [ ] "ORBITAL" title centered at top with accent separator line beneath it
+  [ ] TIME, FEEDBACK, MIX knobs visible and draggable in three columns
+  [ ] Knob text boxes show current values
+  [ ] Waveform visualizer appears in bottom strip
+  [ ] Delay effect is audible on audio input
+  [ ] Increasing FEEDBACK produces longer repeating echoes (≤ 0.95, no runaway)
+  [ ] MIX at 0.0 = fully dry; MIX at 1.0 = fully wet
+  [ ] Visualizer animates when audio is playing
+  [ ] Plugin state persists: save DAW project, reopen, knobs restore correctly
+  [ ] VST3 loads cleanly in a DAW (Reaper, Logic, Ableton, etc.)
+  [ ] No audio glitches, clicks, or denormal CPU spikes
+
+
+================================================================================
+IMPLEMENTATION ORDER SUMMARY
+================================================================================
+
+  1. PluginProcessor.h    — add apvts, delay buffers, FIFO members
+  2. PluginProcessor.cpp  — createParameterLayout(), constructor, prepareToPlay,
+                            processBlock, getStateInformation, setStateInformation,
+                            getTailLengthSeconds
+  3. PluginEditor.h       — add Timer base class, sliders, attachments, visualiser
+  4. PluginEditor.cpp     — constructor, paint, resized, timerCallback, destructor
+  5. Build & test
+
+================================================================================
