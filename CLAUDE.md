@@ -1,18 +1,20 @@
 # Orbital - JUCE Synth Plugin
 
-## Build & Test
+## Build
 
 ```bash
+# Standalone
 cmake --build build --config Release --target Orbital_Standalone -j$(sysctl -n hw.logicalcpu)
 open build/Orbital_artefacts/Release/Standalone/Orbital.app
+
+# VST3 (auto-installs to ~/Library/Audio/Plug-Ins/VST3/)
+cmake --build build --config Release --target Orbital_VST3 -j$(sysctl -n hw.logicalcpu)
 ```
 
-## VST3 Hot Reload in Ableton
+The VST3 build automatically copies the plugin to `~/Library/Audio/Plug-Ins/VST3/Orbital.vst3`. Rescan or reload in Ableton to pick up changes.
 
-After building, create a symlink from the build output to Ableton's Rosetta VST3 directory so the plugin hot-reloads:
+## Project Structure
 
-```bash
-ln -sf "$(pwd)/build/Orbital_artefacts/Release/VST3/Orbital.vst3" "$HOME/Library/Audio/Plug-Ins/VST3/Orbital.vst3"
-```
-
-This only needs to be done once. After that, rebuilding the VST3 target will automatically make the new version available in Ableton (rescan or reopen the project).
+- `src/PluginProcessor.h/.cpp` — Audio engine (oscillators, filters, distortion, envelope, delay)
+- `src/PluginEditor.h/.cpp` — GUI (synthwave-themed with custom LookAndFeel)
+- `CMakeLists.txt` — JUCE CMake build config
