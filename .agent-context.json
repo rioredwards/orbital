@@ -1,0 +1,11 @@
+{
+  "profile": "global",
+  "targets": [
+    "openclaw",
+    "claude",
+    "cursor",
+    "agents"
+  ],
+  "includeGlobal": true,
+  "extraSkills": []
+}
