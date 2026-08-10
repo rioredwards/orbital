@@ -1,5 +1,7 @@
 # Orbital - JUCE Synth Plugin
 
+**Class:** `production`
+
 ## Build
 
 ```bash
